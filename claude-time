@@ -31,20 +31,17 @@ NAME_WIDTH = 50
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("date", nargs="?", metavar="YYYY-MM-DD", help="day to show (default: today)")
-    p.add_argument("--day", metavar="YYYY-MM-DD", help="same as the positional date")
     p.add_argument("--days", type=int, help="last N days that had activity, ending today")
     p.add_argument("--threshold", type=float, default=5, help="idle gap in minutes (default: 5)")
     p.add_argument("--save", action="store_true", help=f"save each shown day to {SAVE_DIR}")
     p.add_argument("--json", action="store_true", help="machine-readable output")
     args = p.parse_args()
-    if args.date and args.day:
-        p.error("give the day once: either positionally or with --day")
-    if (args.date or args.day) and args.days:
+    if args.date and args.days:
         p.error("--days cannot be combined with a single day")
     try:
-        args.chosen_day = date.fromisoformat(args.date or args.day) if (args.date or args.day) else None
+        args.chosen_day = date.fromisoformat(args.date) if args.date else None
     except ValueError:
-        p.error(f"'{args.date or args.day}' is not a date in YYYY-MM-DD format")
+        p.error(f"'{args.date}' is not a date in YYYY-MM-DD format")
     return args
 
 
@@ -249,7 +246,7 @@ def print_day(record):
     print(style(f"  Clock time {fmt(record['merged_seconds'])} (overlaps removed)  ·  "
                 f"Sum of sessions {fmt(record['summed_seconds'])}  ·  Open span {fmt(record['span_seconds'])}", "2"))
     if record["source"] == "saved":
-        print(style(f"  From the saved copy in {SAVE_DIR}: Claude Code's logs no longer have all of this day", "2"))
+        print(style("  Shown from the saved copy: Claude Code's logs no longer have all of this day", "2"))
 
 
 def main():
