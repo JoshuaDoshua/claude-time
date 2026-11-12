@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""Daily summary of Claude Code session activity, read from ~/.claude/projects.
+
+Three measures per day and per project:
+  merged  clock time during which at least one session was working (parallel sessions overlap, not add)
+  summed  running time added up per session (five parallel sessions for 1h = 5h)
+  span    first to last message of each session that day, added up (inflated by sessions left open)
+
+"Working" means consecutive log entries no more than --threshold minutes apart.
+Longer gaps are treated as idle and not counted.
+
+--save writes each shown day to ~/.claude-time/<date>.json. A day that Claude Code's logs no longer
+cover is shown from its saved file. A save never replaces a saved day with a smaller one.
+"""
+import argparse
+import collections
+import glob
+import json
+import os
+import sys
+from datetime import date, datetime, timedelta
+
+PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+SAVE_DIR = os.path.expanduser("~/.claude-time")
+HOME = os.path.expanduser("~")
+LOCAL_TZ = datetime.now().astimezone().tzinfo
+ZERO = timedelta()
+NAME_WIDTH = 50
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("date", nargs="?", metavar="YYYY-MM-DD", help="day to show (default: today)")
+    p.add_argument("--day", metavar="YYYY-MM-DD", help="same as the positional date")
+    p.add_argument("--days", type=int, help="last N days that had activity, ending today")
+    p.add_argument("--threshold", type=float, default=5, help="idle gap in minutes (default: 5)")
+    p.add_argument("--save", action="store_true", help=f"save each shown day to {SAVE_DIR}")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    args = p.parse_args()
+    if args.date and args.day:
+        p.error("give the day once: either positionally or with --day")
+    if (args.date or args.day) and args.days:
+        p.error("--days cannot be combined with a single day")
+    try:
+        args.chosen_day = date.fromisoformat(args.date or args.day) if (args.date or args.day) else None
+    except ValueError:
+        p.error(f"'{args.date or args.day}' is not a date in YYYY-MM-DD format")
+    return args
+
+
+def session_id_for(path):
+    """Top-level file: <project>/<session>.jsonl. Subagent file: <project>/<session>/subagents/<agent>.jsonl."""
+    rel = os.path.relpath(path, PROJECTS_DIR).split(os.sep)
+    return (rel[0], rel[1][:-6]) if len(rel) == 2 else (rel[0], rel[1])
+
+
+def decode_project_dir(dirname):
+    return "/" + dirname.lstrip("-").replace("-", "/")
+
+
+def display_project(cwd):
+    if cwd == HOME:
+        return "~"
+    if cwd.startswith(HOME + "/"):
+        cwd = "~" + cwd[len(HOME):]
+    return cwd.replace("~/Development/", "~/Dev/")
+
+
+def load_sessions():
+    sessions = {}
+    for path in glob.glob(os.path.join(PROJECTS_DIR, "**", "*.jsonl"), recursive=True):
+        key = session_id_for(path)
+        s = sessions.setdefault(key, {"times": [], "cwd": None, "title": None})
+        is_top_level = os.path.basename(os.path.dirname(path)) == key[0]
+        with open(path, errors="ignore") as fh:
+            for line in fh:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                stamp = entry.get("timestamp")
+                if isinstance(stamp, str):
+                    s["times"].append(datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone(LOCAL_TZ))
+                if is_top_level:
+                    if entry.get("cwd") and not s["cwd"]:
+                        s["cwd"] = entry["cwd"]
+                    if entry.get("customTitle"):
+                        s["custom_title"] = entry["customTitle"]
+                    if entry.get("aiTitle"):
+                        s["title"] = entry["aiTitle"]
+    for (project_dir, _), s in sessions.items():
+        if not s["cwd"]:
+            s["cwd"] = decode_project_dir(project_dir)
+        s["title"] = s.get("custom_title") or (f"[auto] {s['title']}" if s["title"] else None)
+    return sessions
+
+
+def split_at_midnight(start, end):
+    while start.date() != end.date():
+        midnight = (start + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        yield start, midnight
+        start = midnight
+    yield start, end
+
+
+def union_length(intervals):
+    total, current_end = ZERO, None
+    for start, end in sorted(intervals):
+        if current_end is None or start > current_end:
+            total += end - start
+            current_end = end
+        elif end > current_end:
+            total += end - current_end
+            current_end = end
+    return total
+
+
+def total_length(intervals):
+    return sum((end - start for start, end in intervals), ZERO)
+
+
+def build_days(sessions, threshold):
+    """days[date][sid] = {project, title, first, last, intervals}"""
+    days = collections.defaultdict(dict)
+    for (_, sid), s in sessions.items():
+        times = sorted(s["times"])
+        if not times:
+            continue
+        by_day = collections.defaultdict(lambda: {"project": display_project(s["cwd"]), "title": s["title"],
+                                                  "first": None, "last": None, "intervals": []})
+        for t in times:
+            rec = by_day[t.date()]
+            rec["first"] = rec["first"] or t
+            rec["last"] = t
+        for a, b in zip(times, times[1:]):
+            if b - a <= threshold:
+                for start, end in split_at_midnight(a, b):
+                    by_day[start.date()]["intervals"].append((start, end))
+        for day, rec in by_day.items():
+            days[day][sid] = rec
+    return days
+
+
+def to_record(day, day_sessions, threshold_minutes):
+    """The one shape used for display, --json and saved files."""
+    seconds = lambda td: int(td.total_seconds())
+    all_iv = [iv for rec in day_sessions.values() for iv in rec["intervals"]]
+    projects = collections.defaultdict(lambda: {"sessions": 0, "iv": [], "span": ZERO})
+    for rec in day_sessions.values():
+        p = projects[rec["project"]]
+        p["sessions"] += 1
+        p["iv"].extend(rec["intervals"])
+        p["span"] += rec["last"] - rec["first"]
+    return {
+        "date": day.isoformat(),
+        "threshold_minutes": threshold_minutes,
+        "sessions": len(day_sessions),
+        "merged_seconds": seconds(union_length(all_iv)),
+        "summed_seconds": seconds(total_length(all_iv)),
+        "span_seconds": seconds(sum((p["span"] for p in projects.values()), ZERO)),
+        "session_list": [{"title": r["title"], "project": r["project"],
+                          "running_seconds": seconds(total_length(r["intervals"])),
+                          "first": r["first"].isoformat(), "last": r["last"].isoformat()}
+                         for r in day_sessions.values()],
+        "projects": {name: {"sessions": p["sessions"], "merged_seconds": seconds(union_length(p["iv"])),
+                            "summed_seconds": seconds(total_length(p["iv"])), "span_seconds": seconds(p["span"])}
+                     for name, p in projects.items()},
+    }
+
+
+def saved_path(day):
+    return os.path.join(SAVE_DIR, f"{day.isoformat()}.json")
+
+
+def load_saved():
+    saved = {}
+    for path in glob.glob(os.path.join(SAVE_DIR, "*.json")):
+        try:
+            with open(path) as fh:
+                record = json.load(fh)
+            saved[date.fromisoformat(record["date"])] = record
+        except (ValueError, KeyError, OSError):
+            print(f"Ignoring unreadable saved file {path}", file=sys.stderr)
+    return saved
+
+
+def save_record(day, record, saved):
+    """Writes the day, unless the saved copy holds more running time than the logs do now."""
+    existing = saved.get(day)
+    if existing and existing["summed_seconds"] > record["summed_seconds"]:
+        print(f"Not saving {day}: saved copy has {fmt(existing['summed_seconds'])} of session time, "
+              f"the logs now show {fmt(record['summed_seconds'])}", file=sys.stderr)
+        return False
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    temp = saved_path(day) + ".tmp"
+    with open(temp, "w") as fh:
+        json.dump(record, fh, indent=2)
+    os.replace(temp, saved_path(day))
+    return True
+
+
+def pick_record(live, saved):
+    """Logs win unless the saved copy holds more running time (the logs were partly deleted)."""
+    if live and (not saved or live["summed_seconds"] >= saved["summed_seconds"]):
+        return {**live, "source": "logs"}
+    if saved:
+        return {**saved, "source": "saved"}
+    return None
+
+
+def fmt(seconds):
+    minutes = round(seconds / 60)
+    return f"{minutes // 60}h{minutes % 60:02d}m"
+
+
+def style(text, code):
+    return f"\033[{code}m{text}\033[0m" if sys.stdout.isatty() else text
+
+
+def short_project(project):
+    return "~" if project == "~" else os.path.basename(project)
+
+
+def truncate(text, width):
+    return text if len(text) <= width else text[:width - 1] + "…"
+
+
+def print_day(record):
+    day = date.fromisoformat(record["date"])
+    print()
+    print(style(f"{day.strftime('%A')} {day}", "1"))
+
+    recs = sorted(record["session_list"], key=lambda r: -r["running_seconds"])
+    names = [truncate(r["title"] or "(untitled)", NAME_WIDTH) for r in recs]
+    name_w = max(len("SESSION"), *(len(n) for n in names))
+    proj_w = max(len("PROJECT"), *(len(short_project(r["project"])) for r in recs))
+    print(style(f"  {'SESSION':<{name_w}}  {'PROJECT':<{proj_w}}  {'RUNNING':>7}  ACTIVE BETWEEN", "2"))
+    for name, r in zip(names, recs):
+        first, last = datetime.fromisoformat(r["first"]), datetime.fromisoformat(r["last"])
+        print(f"  {name:<{name_w}}  {short_project(r['project']):<{proj_w}}  "
+              f"{fmt(r['running_seconds']):>7}  {first:%H:%M}–{last:%H:%M}")
+
+    print()
+    print(style("  By project (overlaps removed)", "2"))
+    for project, p in sorted(record["projects"].items(), key=lambda kv: -kv[1]["merged_seconds"]):
+        print(f"  {'':<{name_w}}  {short_project(project):<{proj_w}}  {fmt(p['merged_seconds']):>7}")
+
+    print()
+    print(style(f"  Clock time {fmt(record['merged_seconds'])} (overlaps removed)  ·  "
+                f"Sum of sessions {fmt(record['summed_seconds'])}  ·  Open span {fmt(record['span_seconds'])}", "2"))
+    if record["source"] == "saved":
+        print(style(f"  From the saved copy in {SAVE_DIR}: Claude Code's logs no longer have all of this day", "2"))
+
+
+def main():
+    args = parse_args()
+    live_days = {}
+    if os.path.isdir(PROJECTS_DIR):
+        built = build_days(load_sessions(), timedelta(minutes=args.threshold))
+        live_days = {d: to_record(d, s, args.threshold) for d, s in built.items()}
+    saved = load_saved()
+    if not live_days and not saved:
+        sys.exit(f"No Claude logs found at {PROJECTS_DIR} and no saved days in {SAVE_DIR}")
+
+    if args.days:
+        chosen = sorted(set(live_days) | set(saved))[-args.days:]
+    else:
+        chosen = [args.chosen_day or date.today()]
+
+    out, saved_count = [], 0
+    for day in chosen:
+        record = pick_record(live_days.get(day), saved.get(day))
+        if not record:
+            if not args.json:
+                print(f"\n{day} {day.strftime('%a')}   no Claude activity")
+            continue
+        if args.save and record["source"] == "logs":
+            saved_count += save_record(day, live_days[day], saved)
+        out.append(record)
+        if not args.json:
+            print_day(record)
+    if args.json:
+        print(json.dumps(out, indent=2))
+    if args.save:
+        print(f"\nSaved {saved_count} day(s) to {SAVE_DIR}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
