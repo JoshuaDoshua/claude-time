@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+"""Evidence and a suggested timesheet for one day, from Chronoid, Chrome, Claude Code and Codex.
+
+Calendar events are passed in with --calendar (the /time-log command in Claude Code reads the calendar).
+Nothing is split or combined between sources. Each number comes from one source, and a source only
+removes overlap with itself. The one exception is the suggestion, which shares agent time evenly
+among the Claude Code and Codex sessions running at the same moment.
+
+Claude Code time is Claude's own turn timer (the durationMs it logs after each turn), placed at the end
+of each turn. The 5-minute rule and tool calls that sat open are shown as evidence and never counted.
+
+Reads only. The one exception is --save, which you ask for and which writes one new file for the day
+under ~/.claude-time/time-log/. A save never replaces an earlier one. --saved shows the latest save of a
+day without reading the sources. Chrome's history is read from a temporary copy that is removed.
+"""
+import argparse
+import collections
+import glob
+import importlib.machinery
+import importlib.util
+import json
+import math
+import os
+import shutil
+import sqlite3
+import sys
+import tempfile
+from datetime import date, datetime, time, timedelta
+
+sys.dont_write_bytecode = True
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+CONFIG_PATH = os.path.join(HERE, "time-log.config.json")
+CHRONOID_DB = os.path.expanduser("~/Library/Application Support/com.vu.Chronoid/db.sqlite")
+CHROME_DIR = os.path.expanduser("~/Library/Application Support/Google/Chrome")
+CODEX_SESSIONS = os.path.expanduser("~/.codex/sessions")
+SAVE_DIR = os.path.expanduser("~/.claude-time/time-log")
+CHROME_EPOCH_OFFSET = 11644473600
+
+UNMAPPED = "Unmapped"
+UNASSIGNED = "Unassigned in Chronoid"
+NO_CATEGORY = "(no category)"
+TABLE_SOURCES = ("chronoid", "chrome", "calendar", "claude", "codex")
+Item = collections.namedtuple("Item", "project source label seconds first last detail")
+Agent = collections.namedtuple("Agent", "source project label intervals first last detail")
+
+
+def load_claude_time():
+    loader = importlib.machinery.SourceFileLoader("claude_time", os.path.join(HERE, "claude-time"))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader("claude_time", loader))
+    loader.exec_module(module)
+    return module
+
+
+claude_time = load_claude_time()
+LOCAL_TZ = claude_time.LOCAL_TZ
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("date", nargs="?", metavar="YYYY-MM-DD", help="day to show (default: today)")
+    p.add_argument("--calendar", metavar="FILE", help="JSON list of attended events: title, start, end")
+    p.add_argument("--show", metavar="PROJECT", help="list the evidence behind one project")
+    p.add_argument("--threshold", type=float, default=5, help="idle gap in minutes (default: 5)")
+    p.add_argument("--save", action="store_true", help=f"also save this run under {SAVE_DIR}")
+    p.add_argument("--saved", action="store_true", help="show the latest saved copy of the day, without reading the sources")
+    args = p.parse_args()
+    if args.save and args.saved:
+        p.error("--save and --saved cannot be combined")
+    try:
+        args.day = date.fromisoformat(args.date) if args.date else date.today()
+    except ValueError:
+        p.error(f"'{args.date}' is not a date in YYYY-MM-DD format")
+    return args
+
+
+def fmt(seconds):
+    minutes = round(seconds / 60)
+    return f"{minutes // 60}h {minutes % 60:02d}m"
+
+
+def from_epoch(seconds):
+    return datetime.fromtimestamp(seconds, LOCAL_TZ)
+
+
+def seconds_of(delta):
+    return int(delta.total_seconds())
+
+
+def clip_to_day(intervals, day):
+    return [(s, e) for a, b in intervals for s, e in claude_time.split_at_midnight(a, b) if s.date() == day]
+
+
+def idle_gap_intervals(stamps, gap):
+    stamps = sorted(stamps)
+    return [(a, b) for a, b in zip(stamps, stamps[1:]) if b - a <= gap]
+
+
+def project_for(rules, cwd, title):
+    for rule in rules:
+        if "cwd_contains" in rule and rule["cwd_contains"] in cwd:
+            return rule["project"]
+        if "title_contains" in rule and title and rule["title_contains"].lower() in title.lower():
+            return rule["project"]
+    return UNMAPPED
+
+
+def chronoid_data(day_start, day_end):
+    items, totals, notes = [], collections.Counter(), []
+    if not os.path.exists(CHRONOID_DB):
+        return items, totals, ["Chronoid: database not found"]
+    con = sqlite3.connect(f"file:{CHRONOID_DB}?mode=ro", uri=True)
+    low, high = day_start.timestamp(), day_end.timestamp()
+    spans = con.execute(
+        """select coalesce(c.category_name, ?), a.app_name, sum(s.duration_seconds), min(s.start_time), max(s.end_time)
+           from activity_spans s join applications a using(app_id)
+           left join categories c on c.category_id = s.assigned_category_id
+           where s.deleted_at is null and s.is_idle = 0 and s.start_time >= ? and s.start_time < ?
+           group by 1, 2""", (UNASSIGNED, low, high)).fetchall()
+    if not spans:
+        notes.append("Chronoid: no data for this day (it was installed 2026-11-12)")
+    for category, app, seconds, first, last in spans:
+        items.append(Item(category, "chronoid", app, seconds, from_epoch(first), from_epoch(last), ""))
+        totals[(category, "chronoid")] += seconds
+    timers = con.execute(
+        """select e.title, coalesce(c.category_name, ?), e.start_time, e.end_time, e.duration_seconds
+           from time_entries e left join categories c using(category_id)
+           where e.deleted_at is null and e.start_time >= ? and e.start_time < ? order by e.start_time""",
+        (NO_CATEGORY, low, high)).fetchall()
+    for title, category, first, last, seconds in timers:
+        items.append(Item(category, "chronoid timer", title, seconds, from_epoch(first), from_epoch(last), ""))
+    return items, totals, notes
+
+
+def chrome_prefix_for(sites, url):
+    bare = url.split("://", 1)[-1]
+    for site in sorted(sites, key=lambda s: -len(s["prefix"])):
+        prefix = site["prefix"]
+        if bare == prefix or (bare.startswith(prefix) and bare[len(prefix)] in "/?#"):
+            return site
+    return None
+
+
+def chrome_data(day_start, day_end, config, gap):
+    items, totals, notes = [], collections.Counter(), []
+    profile_dir = os.path.join(CHROME_DIR, config["profile"])
+    with open(os.path.join(profile_dir, "Preferences")) as fh:
+        account = (json.load(fh).get("account_info") or [{}])[0].get("email")
+    if account != config["account"]:
+        return items, totals, [f"Chrome: profile {config['profile']} is {account}, not {config['account']}. Skipped"]
+    low = (day_start.timestamp() + CHROME_EPOCH_OFFSET) * 1_000_000
+    high = (day_end.timestamp() + CHROME_EPOCH_OFFSET) * 1_000_000
+    with tempfile.TemporaryDirectory() as tmp:
+        for name in ("History", "History-wal"):
+            if os.path.exists(os.path.join(profile_dir, name)):
+                shutil.copy(os.path.join(profile_dir, name), os.path.join(tmp, name))
+        con = sqlite3.connect(f"file:{os.path.join(tmp, 'History')}?mode=ro", uri=True)
+        visits = con.execute("select u.url, v.visit_time from visits v join urls u on u.id = v.url "
+                             "where v.visit_time >= ? and v.visit_time < ?", (low, high)).fetchall()
+    stamps_by_site, unmapped_visits = collections.defaultdict(list), 0
+    for url, visit_time in visits:
+        site = chrome_prefix_for(config["sites"], url)
+        if site:
+            stamps_by_site[site["prefix"]].append(from_epoch(visit_time / 1_000_000 - CHROME_EPOCH_OFFSET))
+        else:
+            unmapped_visits += 1
+    project_of = {s["prefix"]: s["project"] for s in config["sites"]}
+    intervals_by_project = collections.defaultdict(list)
+    for prefix, stamps in stamps_by_site.items():
+        intervals = idle_gap_intervals(stamps, gap)
+        intervals_by_project[project_of[prefix]].extend(intervals)
+        seconds = seconds_of(claude_time.total_length(intervals))
+        items.append(Item(project_of[prefix], "chrome", prefix, seconds, min(stamps), max(stamps), f"{len(stamps)} visits"))
+    for project, intervals in intervals_by_project.items():
+        totals[(project, "chrome")] = seconds_of(claude_time.union_length(intervals))
+    notes.append(f"Chrome: {unmapped_visits} visits to sites not in the config are not counted")
+    return items, totals, notes
+
+
+def claude_agents(day, gap, rules):
+    """Running time is Claude's own turn timer, placed at the end of each turn. The 5-minute rule and the
+    open tool calls are kept as evidence next to it, and are not counted."""
+    sessions = claude_time.load_sessions()
+    session_by_id = {sid: s for (_, sid), s in sessions.items()}
+    agents, open_calls = [], []
+    for sid, rec in claude_time.build_days(sessions, gap).get(day, {}).items():
+        s = session_by_id[sid]
+        project = project_for(rules, rec["project"], rec["title"])
+        label = rec["title"] or "(untitled)"
+        turns = clip_to_day([(end - timedelta(seconds=seconds), end) for end, seconds in s["turns"]], day)
+        calls = clip_to_day(claude_time.tool_call_spans(s["tool_starts"], s["tool_ends"]), day)
+        five_minute_rule = claude_time.union_length(rec["intervals"])
+        open_call_extra = claude_time.union_length(rec["intervals"] + calls) - five_minute_rule
+        timers = sum(1 for end, _ in s["turns"] if end.date() == day)
+        prompts = sum(1 for moment in s["prompts"] if moment.date() == day)
+        detail = (f"5-minute rule {fmt(seconds_of(five_minute_rule))}, open tool calls add "
+                  f"{fmt(seconds_of(open_call_extra))}, {timers} turn timers for {prompts} prompts")
+        agents.append(Agent("claude", project, label, turns, rec["first"], rec["last"], detail))
+        open_calls += [Item(project, "claude open call", label, seconds_of(end - start), start, end, "not counted")
+                       for start, end in claude_time.merge_intervals(calls) if end - start > gap]
+    return agents, open_calls
+
+
+def codex_agents(day, day_start, day_end, gap, rules):
+    agents = []
+    for path in glob.glob(os.path.join(CODEX_SESSIONS, "*", "*", "*", "*.jsonl")):
+        if os.path.getmtime(path) < day_start.timestamp():
+            continue
+        meta, stamps = None, []
+        with open(path, errors="ignore") as fh:
+            for line in fh:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if entry.get("type") == "session_meta":
+                    meta = entry["payload"]
+                if isinstance(entry.get("timestamp"), str):
+                    stamps.append(datetime.fromisoformat(entry["timestamp"].replace("Z", "+00:00")).astimezone(LOCAL_TZ))
+        if not meta or meta.get("thread_source") == "guardian_review":
+            continue
+        intervals = clip_to_day(idle_gap_intervals(stamps, gap), day)
+        today = [t for t in stamps if t.date() == day]
+        if today:
+            cwd = meta.get("cwd", "")
+            agents.append(Agent("codex", project_for(rules, cwd, None), os.path.basename(cwd), intervals,
+                                min(today), max(today), ""))
+    return agents
+
+
+def agent_data(agents):
+    items, totals = [], {}
+    for source in ("claude", "codex"):
+        intervals_by_project = collections.defaultdict(list)
+        for agent in (a for a in agents if a.source == source):
+            intervals_by_project[agent.project].extend(agent.intervals)
+            seconds = seconds_of(claude_time.union_length(agent.intervals))
+            items.append(Item(agent.project, source, agent.label, seconds, agent.first, agent.last, agent.detail))
+        for project, intervals in intervals_by_project.items():
+            totals[(project, source)] = seconds_of(claude_time.union_length(intervals))
+    return items, totals
+
+
+def split_agent_time(agents):
+    """Every slice of time is shared evenly among the agents running in it."""
+    events = []
+    for agent in agents:
+        merged = []
+        for start, end in sorted(agent.intervals):
+            if merged and start <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], end)
+            else:
+                merged.append([start, end])
+        for start, end in merged:
+            events += [(start, 1, id(agent), agent.project), (end, -1, id(agent), agent.project)]
+    events.sort(key=lambda e: (e[0], -e[1]))
+    running, shares, last = {}, collections.Counter(), None
+    for moment, direction, agent_id, project in events:
+        if last and running:
+            seconds = (moment - last).total_seconds()
+            for running_project in running.values():
+                shares[running_project] += seconds / len(running)
+        if direction == 1:
+            running[agent_id] = project
+        else:
+            running.pop(agent_id, None)
+        last = moment
+    return shares
+
+
+def calendar_data(path, rules):
+    items, totals, notes = [], {}, []
+    if not path:
+        return items, totals, ["Calendar: no events given, so none are counted"]
+    with open(path) as fh:
+        events = json.load(fh)
+    intervals_by_project = collections.defaultdict(list)
+    for event in events:
+        start, end = (datetime.fromisoformat(event[k]).astimezone(LOCAL_TZ) for k in ("start", "end"))
+        project = next((r["project"] for r in rules if r["title_contains"].lower() in event["title"].lower()), UNMAPPED)
+        intervals_by_project[project].append((start, end))
+        items.append(Item(project, "calendar", event["title"], seconds_of(end - start), start, end, ""))
+    for project, intervals in intervals_by_project.items():
+        totals[(project, "calendar")] = seconds_of(claude_time.union_length(intervals))
+    return items, totals, notes
+
+
+def table_rows(totals, hidden, rollup):
+    names = {project for project, source in totals if source in TABLE_SOURCES and project not in hidden}
+    groups = collections.defaultdict(list)
+    for name in names:
+        groups[rollup.get(name, name)].append(name)
+    group_size = lambda g: sum(totals.get((n, s), 0) for n in groups[g] for s in TABLE_SOURCES)
+    rows = []
+    for group in sorted(groups, key=lambda g: -group_size(g)):
+        members = sorted(groups[group], key=lambda n: (n != group, n))
+        if group in members and len(members) > 1:
+            rows.append((f"{group} (as one)", group))
+            rows += [(f"  {name}", name) for name in members if name != group]
+        else:
+            rows += [(name, name) for name in members]
+    return rows
+
+
+def print_table(day, totals, hidden, rollup):
+    rows = table_rows(totals, hidden, rollup)
+    label_w = max([len("PROJECT")] + [len(label) for label, _ in rows])
+    cell = lambda name, source: fmt(totals[(name, source)]) if (name, source) in totals else "–"
+    print()
+    print(f"{day.strftime('%A')} {day}")
+    print(f"  {'':<{label_w}}  {'HANDS-ON':<28}  AGENTS RUNNING")
+    print(f"  {'PROJECT':<{label_w}}  {'Chronoid':>8}  {'Chrome':>8}  {'Calendar':>8}  {'Claude Code':>11}  {'Codex':>8}")
+    for label, name in rows:
+        print(f"  {label:<{label_w}}  {cell(name, 'chronoid'):>8}  {cell(name, 'chrome'):>8}  "
+              f"{cell(name, 'calendar'):>8}  {cell(name, 'claude'):>11}  {cell(name, 'codex'):>8}")
+
+
+def quarter_hours(seconds):
+    return max(0.25, math.floor(seconds / 3600 * 4 + 0.5) / 4)
+
+
+def print_suggestion(totals, shares, hidden, rollup):
+    rolled = lambda name: rollup.get(name, name)
+    rows = collections.defaultdict(lambda: collections.Counter())
+    for (name, source), seconds in totals.items():
+        if name not in hidden and source in ("chronoid", "chrome", "calendar"):
+            rows[rolled(name)][source] += seconds
+    for name, seconds in shares.items():
+        rows[rolled(name)]["agents"] += seconds
+    lines, under_30_seconds = [], []
+    for name, row in rows.items():
+        from_chrome = row["chronoid"] == 0 and row["chrome"] > 0
+        hands = row["chrome"] if from_chrome else row["chronoid"]
+        total = hands + row["agents"] + row["calendar"]
+        if total >= 30:
+            lines.append((name, hands, from_chrome, row["agents"], row["calendar"], total))
+        elif total > 0:
+            under_30_seconds.append(name)
+    lines.sort(key=lambda l: -l[5])
+    name_w = max([len("PROJECT")] + [len(l[0]) for l in lines])
+    print()
+    print("Suggested timesheet")
+    print(f"  {'PROJECT':<{name_w}}  {'Hands-on':>9}  {'Agents*':>8}  {'Meeting':>8}  {'Sum':>8}  {'LOG':>5}")
+    logged = 0
+    for name, hands, from_chrome, agents, meeting, total in lines:
+        log = "?" if name == UNMAPPED else f"{quarter_hours(total):.2f}"
+        logged += 0 if name == UNMAPPED else quarter_hours(total)
+        hands_text = fmt(hands) + ("†" if from_chrome else " ")
+        print(f"  {name:<{name_w}}  {hands_text:>9}  {fmt(agents):>8}  {fmt(meeting):>8}  {fmt(total):>8}  {log:>5}")
+    print(f"  {'Total':<{name_w}}  {'':>9}  {'':>8}  {'':>8}  {'':>8}  {logged:>5.2f}")
+    print()
+    print("  * Agent time is shared evenly among the Claude Code and Codex sessions running at the same moment.")
+    print("  † Chronoid has no time for this project, so the Chrome estimate is used.")
+    print("  Rounded to the nearest 0.25, minimum 0.25. A ? means the evidence has no project yet.")
+    if under_30_seconds:
+        print(f"  Under 30 seconds, not listed: {', '.join(sorted(under_30_seconds))}")
+
+
+def print_left_out(totals, items, hidden):
+    parts = [f"{name} {fmt(totals[(name, 'chronoid')])}" for name in sorted(hidden) if (name, "chronoid") in totals]
+    if parts:
+        print(f"  Left out (Chronoid): {', '.join(parts)}")
+    timers = [f"{i.label} {fmt(i.seconds)}" for i in items if i.source == "chronoid timer" and i.project == NO_CATEGORY]
+    if timers:
+        print(f"  Chronoid timers with no category: {', '.join(timers)}")
+
+
+def print_evidence(project, items, rollup):
+    names = {project.lower()} | {k.lower() for k, v in rollup.items() if v.lower() == project.lower()}
+    shown = sorted((i for i in items if i.project.lower() in names), key=lambda i: (i.source, i.first))
+    print()
+    if not shown:
+        print(f"No evidence found for '{project}'")
+    for i in shown:
+        print(f"  {i.source:<16} {i.project:<20} {i.label[:55]:<55} {fmt(i.seconds):>8}  "
+              f"{i.first:%H:%M}–{i.last:%H:%M}  {i.detail}")
+
+
+def gather(args, config):
+    """Everything one run knows about the day. This is also what --save writes."""
+    gap = timedelta(minutes=args.threshold)
+    day_start = datetime.combine(args.day, time.min, tzinfo=LOCAL_TZ)
+    day_end = day_start + timedelta(days=1)
+    claude_sessions, open_calls = claude_agents(args.day, gap, config["claude_sessions"])
+    agents = claude_sessions + codex_agents(args.day, day_start, day_end, gap, config["codex_sessions"])
+    sources = [chronoid_data(day_start, day_end), chrome_data(day_start, day_end, config["chrome"], gap),
+               calendar_data(args.calendar, config["calendar"]["events"])]
+    agent_items, agent_totals = agent_data(agents)
+    totals = {}
+    for _, source_totals, _ in sources:
+        totals.update(source_totals)
+    totals.update(agent_totals)
+    calendar_events = []
+    if args.calendar:
+        with open(args.calendar) as fh:
+            calendar_events = json.load(fh)
+    return {"date": args.day.isoformat(), "threshold_minutes": args.threshold,
+            "items": [i for source_items, _, _ in sources for i in source_items] + agent_items + open_calls,
+            "totals": totals, "notes": [n for _, _, notes in sources for n in notes],
+            "shares": dict(split_agent_time(agents)), "calendar": calendar_events}
+
+
+def report_to_json(report):
+    return {**{key: report[key] for key in ("date", "threshold_minutes", "notes", "shares", "calendar")},
+            "saved_at": datetime.now(LOCAL_TZ).isoformat(timespec="seconds"),
+            "totals": [[project, source, seconds] for (project, source), seconds in report["totals"].items()],
+            "items": [{**i._asdict(), "first": i.first.isoformat(), "last": i.last.isoformat()} for i in report["items"]]}
+
+
+def report_from_json(data):
+    items = [Item(**{**i, "first": datetime.fromisoformat(i["first"]), "last": datetime.fromisoformat(i["last"])})
+             for i in data["items"]]
+    return {**data, "items": items, "totals": {(project, source): seconds for project, source, seconds in data["totals"]}}
+
+
+def save_report(report):
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    path = os.path.join(SAVE_DIR, f"{report['date']}_{datetime.now():%H%M%S}.json")
+    with open(path, "x") as fh:
+        json.dump(report_to_json(report), fh, indent=2)
+    return path
+
+
+def load_latest_saved(day):
+    saves = sorted(glob.glob(os.path.join(SAVE_DIR, f"{day.isoformat()}_*.json")))
+    if not saves:
+        sys.exit(f"No saved copy of {day} in {SAVE_DIR}. Run with --save first.")
+    with open(saves[-1]) as fh:
+        return report_from_json(json.load(fh))
+
+
+def render(report, show, config):
+    hidden = set(config["non_project_categories"]) | {UNASSIGNED}
+    if show:
+        print_evidence(show, report["items"], config["rollup"])
+        return
+    print_table(date.fromisoformat(report["date"]), report["totals"], hidden, config["rollup"])
+    print_left_out(report["totals"], report["items"], hidden)
+    print("  Claude Code is Claude's own turn timer. '--show <project>' lists the 5-minute rule and the open tool calls beside it.")
+    for note in report["notes"]:
+        print(f"  {note}")
+    print_suggestion(report["totals"], report["shares"], hidden, config["rollup"])
+
+
+def main():
+    args = parse_args()
+    with open(CONFIG_PATH) as fh:
+        config = json.load(fh)
+    if args.saved:
+        report = load_latest_saved(args.day)
+        print(f"Shown from the copy saved {report['saved_at']}.")
+    else:
+        report = gather(args, config)
+    render(report, args.show, config)
+    if args.save:
+        print(f"\nSaved to {save_report(report)}")
+
+
+if __name__ == "__main__":
+    main()

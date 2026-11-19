@@ -1,0 +1,32 @@
+{
+  "chrome": {
+    "profile": "Default",
+    "account": "joshua@lgnd.com",
+    "sites": [
+      {"prefix": "github.com/lgndhq/apollo-core", "project": "ApolloCore"},
+      {"prefix": "github.com/lgndhq/innovation-exchange-lz-admin", "project": "IX-LZ"},
+      {"prefix": "github.com/lgndhq/innovation-exchange", "project": "IX"},
+      {"prefix": "github.com/lgndhq/toyota-policy-drivers-site", "project": "Toyota"},
+      {"prefix": "auth-dev.pavus.ai", "project": "Pavus"},
+      {"prefix": "avelon.lgndtech.dev", "project": "Avelon"},
+      {"prefix": "quorum.us", "project": "Toyota"}
+    ]
+  },
+  "claude_sessions": [
+    {"cwd_contains": "~/Dev/bechtel", "project": "Bechtel"},
+    {"cwd_contains": "~/Dev/pavus", "project": "Pavus"},
+    {"cwd_contains": "lgnd-tpd", "project": "Toyota"},
+    {"title_contains": "time tracking", "project": "LGND Admin"}
+  ],
+  "codex_sessions": [
+    {"cwd_contains": "ix-landing-zone-admin", "project": "IX-LZ"}
+  ],
+  "calendar": {
+    "calendars": ["joshua@lgnd.com", "josh@lgndx.com"],
+    "events": [
+      {"title_contains": "daily standup", "project": "LGND Admin"}
+    ]
+  },
+  "non_project_categories": ["Meetings", "Distraction"],
+  "rollup": {"IX": "Innovation Exchange", "IX-LZ": "Innovation Exchange"}
+}
