@@ -164,7 +164,6 @@ Files in this repo:
 **Known problems:**
 - On 2026-11-13 the three measures for Claude Code gave very different results (turn timer / 5-minute rule / including open tool calls): `translations` 3h 38m / 2h 22m / 11h 18m, `pavus-memory` 1h 00m / 2h 18m / 11h 08m. What the turn timer counts exactly is not documented, and it is only logged when a turn ends, so interrupted or still-running turns have none. Calls were found open for days (the longest 117.8 hours in September, results arriving on weekend or Monday mornings), none reaching into 2026-11-12 or 11-13.
 - Codex time is unchanged: it still uses the 5-minute rule.
-- `time-log` has no README.
 
 ## 5. Approved, not built
 
@@ -179,7 +178,11 @@ The user said "i'm cool to do all of those" about this list of cross-checks that
 ## 5b. Optional, not built
 - **Range view.** Adding up the saved days by project over a week or a month, with the suggested hours per day and in total, and optionally a place to record the hours the user actually logged. The user: "yeah, lets keep range as an option". Before that: "i'm curious about the range view, but i probably won't do it." A mockup from the saved days of 2026-11-12 to 11-18 was shown. Nothing was built.
 
-## 6. Parked: a stand-alone recorder to replace Chronoid
+## 6. The stand-alone recorder (unparked 2026-11-20: "start building the auto-tracker")
+
+Building started in `tracker/`. `tracker/tracker.swift` is one Swift file with no packages, built by `tracker/build` to `~/.claude-time/bin/tracker` (outside the repo). It writes `~/.claude-time/tracker/<date>.jsonl`, one line per event, appended and flushed as it happens. It is event driven (app switches, window and tab changes) with a 30-second heartbeat that records idle seconds as they are. It records facts and decides nothing. It is not installed to start at login: that needs the user's go-ahead, and Chronoid stays running until the new recorder has been compared with it.
+
+First real test on 2026-11-20, about 95 seconds of the user switching Ghostty tabs and Chrome tabs: Accessibility permission worked after a restart, every switch was recorded (28 focus events where Chronoid saw 18 in the same time), Ghostty tabs came with their name and folder, Chrome tab titles including the profile were recorded, and the heartbeat recorded idle seconds. Not tested yet: Slack and Zoom titles, long idle, sleep and wake, screen lock, a full day, and starting at login. Three Ghostty tabs in one folder (`pavus-quote`, `pavus-memory`, `pavus-chat`) are told apart only by tab name.
 
 The user's words on where this stands: "okay. let's get the tooling in a good place, and then comeback to the stand-alone app."
 
@@ -312,3 +315,7 @@ What the user said:
 86. "yeah, lets keep range as an option"
 87. "wait. what's the diff between claude-time and time-log" (answered: `claude-time` reads only Claude Code logs with the 5-minute rule, `time-log` combines all sources and imports `claude-time`)
 88. "- Still unanswered: whether you enter time in Everhour, and whether you run two sessions in one folder. i have answered this so many times. i fucking log the time. and i may run two sessinons in one folder. as evidenced by pavus."
+89. "start building the auto-tracker"
+90. "SURE" (the first real test run of the recorder)
+91. "it's running"
+92. "done"
