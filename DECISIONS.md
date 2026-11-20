@@ -71,6 +71,10 @@ How the user works today:
 - Later, instead of asking about attendance: "if i dont accept them, just say unaccepted. but you should also be able to see zoom interactions and guess wehtehre or not i attended, but leave it flagged as a guess or assumption."
 - Built: an event the user has not accepted shows as "unaccepted". For a Zoom meeting, the tool guesses attendance from the Zoom "Zoom Meeting" window in Chronoid (5 minutes or more counts as attended) and labels it "GUESS". A meeting not on Zoom, or a time with no Chronoid data, gets no guess and is not counted. The user's own answers are kept in the config under `attendance_stated`. Claude chose the 5 minutes and the Zoom-only guess.
 
+### Facts the user stated
+- On entering time (Claude had asked whether they enter it in Everhour): "i fucking log the time." Claude's reading: the user enters their own time. The answer did not name a system, and `app.everhour.com` appears in their Chrome history.
+- On running two sessions in one folder: "i may run two sessinons in one folder. as evidenced by pavus." The logs agree: `pavus-memory` and `pavus-chat-actions` both run in the pavus folder.
+
 ### Output
 - One table per day, one row per project, one column per source. The user: "yes, but that's incredibly difficult to read and follow", then accepted a table with proof available on request ("that's pretty good. perfect").
 - Durations as hours and minutes: "you have 93m and then 1h 38m - i want 1h 33m and 1h 38m". Under an hour is shown as `0h 09m`.
@@ -204,8 +208,6 @@ What the user said:
 ## 7. Open questions
 
 - Whether the tool should keep the hours the user finally logs each day, so a week or month can be summarized by project. Asked, not answered.
-- Whether the user enters time in Everhour (`app.everhour.com` appeared in Chrome history 7 times on 2026-11-12 and 11-13). Asked, not answered.
-- Whether the user often runs two Claude or Codex sessions in the same folder. Asked, not answered.
 - What `apollo-ix` is, and whether it needs a mapping.
 - Which of Section 5 to build first.
 
@@ -308,3 +310,5 @@ What the user said:
 84. "got it. what's next?"
 85. "hmm. i'm curious about the range view, but i probably won't do it. can you give me an idea"
 86. "yeah, lets keep range as an option"
+87. "wait. what's the diff between claude-time and time-log" (answered: `claude-time` reads only Claude Code logs with the 5-minute rule, `time-log` combines all sources and imports `claude-time`)
+88. "- Still unanswered: whether you enter time in Everhour, and whether you run two sessions in one folder. i have answered this so many times. i fucking log the time. and i may run two sessinons in one folder. as evidenced by pavus."
