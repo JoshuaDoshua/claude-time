@@ -27,6 +27,14 @@
       {"title_contains": "daily standup", "project": "LGND Admin"}
     ]
   },
+  "attendance": {
+    "zoom_window": {"app": "Zoom", "title_contains": "Zoom Meeting"},
+    "min_minutes": 5
+  },
+  "attendance_stated": [
+    {"date": "2026-11-12", "title_contains": "DTO Weekly", "attended": false},
+    {"date": "2026-11-13", "title_contains": "INVERT Scope Lock", "attended": false}
+  ],
   "non_project_categories": ["Meetings", "Distraction"],
   "rollup": {"IX": "Innovation Exchange", "IX-LZ": "Innovation Exchange"}
 }

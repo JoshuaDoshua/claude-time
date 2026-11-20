@@ -21,6 +21,7 @@ import importlib.util
 import json
 import math
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -62,6 +63,7 @@ def parse_args():
     p.add_argument("--calendar", metavar="FILE", help="JSON list of attended events: title, start, end")
     p.add_argument("--show", metavar="PROJECT", help="list the evidence behind one project")
     p.add_argument("--threshold", type=float, default=5, help="idle gap in minutes (default: 5)")
+    p.add_argument("--events", metavar="FILE", help="show what Chronoid had in front during each event in FILE, then stop")
     p.add_argument("--save", action="store_true", help=f"also save this run under {SAVE_DIR}")
     p.add_argument("--saved", action="store_true", help="show the latest saved copy of the day, without reading the sources")
     args = p.parse_args()
@@ -105,6 +107,16 @@ def project_for(rules, cwd, title):
     return UNMAPPED
 
 
+def clean_window_title(app, title):
+    """Slack changes its title with unread state: a leading ! or *, and '- N new item(s)'. Strip both so one
+    channel is one name."""
+    if app != "Slack":
+        return title
+    title = re.sub(r"^[!*]\s+", "", title)
+    title = re.sub(r" - \d+ new items?", "", title)
+    return re.sub(r" - Slack( \[Main\].*)?$", "", title)
+
+
 def chronoid_data(day_start, day_end):
     items, totals, notes = [], collections.Counter(), []
     if not os.path.exists(CHRONOID_DB):
@@ -112,16 +124,28 @@ def chronoid_data(day_start, day_end):
     con = sqlite3.connect(f"file:{CHRONOID_DB}?mode=ro", uri=True)
     low, high = day_start.timestamp(), day_end.timestamp()
     spans = con.execute(
-        """select coalesce(c.category_name, ?), a.app_name, sum(s.duration_seconds), min(s.start_time), max(s.end_time)
+        """select coalesce(c.category_name, ?), a.app_name, coalesce(w.title_text, ''),
+                  sum(s.duration_seconds), min(s.start_time), max(s.end_time)
            from activity_spans s join applications a using(app_id)
+           left join window_titles w using(window_title_id)
            left join categories c on c.category_id = s.assigned_category_id
            where s.deleted_at is null and s.is_idle = 0 and s.start_time >= ? and s.start_time < ?
-           group by 1, 2""", (UNASSIGNED, low, high)).fetchall()
+           group by 1, 2, 3""", (UNASSIGNED, low, high)).fetchall()
     if not spans:
-        notes.append("Chronoid: no data for this day (it was installed 2026-11-12)")
-    for category, app, seconds, first, last in spans:
-        items.append(Item(category, "chronoid", app, seconds, from_epoch(first), from_epoch(last), ""))
-        totals[(category, "chronoid")] += seconds
+        notes.append("Chronoid: no data for this day")
+    by_app = {}
+    for category, app, window, seconds, first, last in spans:
+        entry = by_app.setdefault((category, app), {"seconds": 0, "first": first, "last": last,
+                                                    "windows": collections.Counter()})
+        entry["seconds"] += seconds
+        entry["first"], entry["last"] = min(entry["first"], first), max(entry["last"], last)
+        entry["windows"][clean_window_title(app, window)] += seconds
+    for (category, app), entry in by_app.items():
+        top_windows = ", ".join(f"{window[:40] or '(no title)'} {fmt(seconds)}"
+                                for window, seconds in entry["windows"].most_common(3))
+        items.append(Item(category, "chronoid", app, entry["seconds"], from_epoch(entry["first"]),
+                          from_epoch(entry["last"]), top_windows))
+        totals[(category, "chronoid")] += entry["seconds"]
     timers = con.execute(
         """select e.title, coalesce(c.category_name, ?), e.start_time, e.end_time, e.duration_seconds
            from time_entries e left join categories c using(category_id)
@@ -268,18 +292,82 @@ def split_agent_time(agents):
     return shares
 
 
-def calendar_data(path, rules):
+def event_times(event):
+    return tuple(datetime.fromisoformat(event[key]).astimezone(LOCAL_TZ) for key in ("start", "end"))
+
+
+def chronoid_during(start, end):
+    """What Chronoid had in front between two moments, biggest first. Evidence only."""
+    if not os.path.exists(CHRONOID_DB):
+        return "Chronoid: database not found"
+    con = sqlite3.connect(f"file:{CHRONOID_DB}?mode=ro", uri=True)
+    low, high = start.timestamp(), end.timestamp()
+    rows = con.execute(
+        """select a.app_name, sum(min(s.end_time, ?) - max(s.start_time, ?))
+           from activity_spans s join applications a using(app_id)
+           where s.deleted_at is null and s.is_idle = 0 and s.end_time > ? and s.start_time < ?
+           group by 1 order by 2 desc limit 5""", (high, low, low, high)).fetchall()
+    if not rows:
+        return "Chronoid had no data for this time"
+    return "Chronoid in front: " + ", ".join(f"{app} {fmt(seconds)}" for app, seconds in rows)
+
+
+def zoom_in_front(start, end, window):
+    """Seconds Chronoid had the Zoom meeting window in front, and whether it had any data for this time."""
+    if not os.path.exists(CHRONOID_DB):
+        return 0, False
+    con = sqlite3.connect(f"file:{CHRONOID_DB}?mode=ro", uri=True)
+    low, high = start.timestamp(), end.timestamp()
+    has_data = con.execute("select count(*) from activity_spans where deleted_at is null and end_time > ? "
+                           "and start_time < ?", (low, high)).fetchone()[0] > 0
+    seconds = con.execute(
+        """select coalesce(sum(min(s.end_time, ?) - max(s.start_time, ?)), 0)
+           from activity_spans s join applications a using(app_id) join window_titles w using(window_title_id)
+           where s.deleted_at is null and s.is_idle = 0 and a.app_name = ? and w.title_text like ?
+             and s.end_time > ? and s.start_time < ?""",
+        (high, low, window["app"], f"%{window['title_contains']}%", low, high)).fetchone()[0]
+    return seconds, has_data
+
+
+def attendance_of(event, start, end, config):
+    """Whether to count an event, and the flag that says why. A guess is always labelled as a guess."""
+    stated = next((s for s in config["attendance_stated"] if s["date"] == start.date().isoformat()
+                   and s["title_contains"].lower() in event["title"].lower()), None)
+    if stated:
+        return stated["attended"], f"you said you {'attended' if stated['attended'] else 'did not attend'}"
+    response = event.get("response", "accepted")
+    if response == "accepted":
+        return True, "accepted"
+    unaccepted = f"unaccepted ({response})"
+    platform = event.get("platform", "Zoom")
+    if platform != "Zoom":
+        return False, f"{unaccepted}, no guess: it is {platform} and Chronoid only shows Zoom windows"
+    seconds, has_data = zoom_in_front(start, end, config["attendance"]["zoom_window"])
+    if not has_data:
+        return False, f"{unaccepted}, no guess: Chronoid has no data for this time"
+    verdict = "attended" if seconds >= config["attendance"]["min_minutes"] * 60 else "did not attend"
+    return verdict == "attended", f"{unaccepted}, GUESS {verdict}: Zoom meeting window in front {fmt(seconds)}"
+
+
+def calendar_data(path, config):
     items, totals, notes = [], {}, []
     if not path:
         return items, totals, ["Calendar: no events given, so none are counted"]
     with open(path) as fh:
         events = json.load(fh)
+    rules = config["calendar"]["events"]
     intervals_by_project = collections.defaultdict(list)
     for event in events:
-        start, end = (datetime.fromisoformat(event[k]).astimezone(LOCAL_TZ) for k in ("start", "end"))
+        start, end = event_times(event)
         project = next((r["project"] for r in rules if r["title_contains"].lower() in event["title"].lower()), UNMAPPED)
-        intervals_by_project[project].append((start, end))
-        items.append(Item(project, "calendar", event["title"], seconds_of(end - start), start, end, ""))
+        counted, flag = attendance_of(event, start, end, config)
+        if counted:
+            intervals_by_project[project].append((start, end))
+        if flag != "accepted":
+            notes.append(f"Calendar: {event['title'].strip()} {start:%H:%M}–{end:%H:%M}: {flag}. "
+                         f"{'Counted' if counted else 'Not counted'}.")
+        items.append(Item(project, "calendar" if counted else "calendar not counted", event["title"].strip(),
+                          seconds_of(end - start), start, end, f"{flag}. {chronoid_during(start, end)}"))
     for project, intervals in intervals_by_project.items():
         totals[(project, "calendar")] = seconds_of(claude_time.union_length(intervals))
     return items, totals, notes
@@ -372,8 +460,18 @@ def print_evidence(project, items, rollup):
     if not shown:
         print(f"No evidence found for '{project}'")
     for i in shown:
-        print(f"  {i.source:<16} {i.project:<20} {i.label[:55]:<55} {fmt(i.seconds):>8}  "
+        print(f"  {i.source:<20} {i.project:<20} {i.label[:55]:<55} {fmt(i.seconds):>8}  "
               f"{i.first:%H:%M}–{i.last:%H:%M}  {i.detail}")
+
+
+def print_events(path, config):
+    with open(path) as fh:
+        events = json.load(fh)
+    for event in events:
+        start, end = event_times(event)
+        print(f"  {start:%a %m-%d %H:%M}–{end:%H:%M}  {event['title'].strip()}")
+        print(f"      {attendance_of(event, start, end, config)[1]}")
+        print(f"      {chronoid_during(start, end)}")
 
 
 def gather(args, config):
@@ -384,7 +482,7 @@ def gather(args, config):
     claude_sessions, open_calls = claude_agents(args.day, gap, config["claude_sessions"])
     agents = claude_sessions + codex_agents(args.day, day_start, day_end, gap, config["codex_sessions"])
     sources = [chronoid_data(day_start, day_end), chrome_data(day_start, day_end, config["chrome"], gap),
-               calendar_data(args.calendar, config["calendar"]["events"])]
+               calendar_data(args.calendar, config)]
     agent_items, agent_totals = agent_data(agents)
     totals = {}
     for _, source_totals, _ in sources:
@@ -446,6 +544,9 @@ def main():
     args = parse_args()
     with open(CONFIG_PATH) as fh:
         config = json.load(fh)
+    if args.events:
+        print_events(args.events, config)
+        return
     if args.saved:
         report = load_latest_saved(args.day)
         print(f"Shown from the copy saved {report['saved_at']}.")

@@ -8,11 +8,14 @@ Run from the repo root of claude-time. The day is the argument, or today if none
 
 1. Load the Google Calendar tools with ToolSearch, then list that day's events for each calendar in
    `time-log.config.json` under `calendar.calendars`. Use only those calendars.
-2. Keep the event title, start and end of every event. Ask the user about attendance for any event they have not
-   accepted. Drop the events they did not attend. Do not guess attendance, and do not ask about events they accepted.
-3. Write the attended events to a JSON file in the scratchpad: a list of `{"title", "start", "end"}`, with start and
-   end as ISO timestamps that include the offset.
-4. Run `./time-log <date> --calendar <file>` and show its output as it is.
+2. Keep the title, start and end of every event, and the user's own response to it (`accepted`, `declined`,
+   `needsAction` or `tentative`). If the conference is not Zoom, also keep its platform (`Google Meet`,
+   `Microsoft Teams`). Do not ask the user about attendance. `time-log` marks events the user has not accepted
+   as unaccepted, guesses attendance from the Zoom meeting window in Chronoid, and labels the guess as a guess.
+3. Write every event, not only accepted ones, to a JSON file in the scratchpad: a list of
+   `{"title", "start", "end", "response"}` plus `"platform"` when it is not Zoom. Start and end are ISO timestamps
+   that include the offset.
+4. Run `./time-log <date> --calendar <file>` and show its output as it is, including the lines about unaccepted events.
 5. `./time-log <date> --show <project>` lists the evidence behind one project. Use it when the user asks to see proof.
 6. Add `--save` to the run only when the user asks to save the day. `./time-log <date> --saved` shows the latest
    save of a day without reading the sources.

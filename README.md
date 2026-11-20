@@ -143,14 +143,17 @@ Claude Code, which is why the command exists. It lives in `.claude/skills/time-l
 You can also run the script yourself. Without `--calendar` it counts no meetings.
 
 ```
-./time-log 2026-11-12 --calendar events.json   # events.json: a list of {"title", "start", "end"}
+./time-log 2026-11-12 --calendar events.json   # a list of {"title", "start", "end", "response"}
 ./time-log 2026-11-12 --show Pavus             # the evidence behind one project
 ./time-log --threshold 10                      # idle gap in minutes (default 5)
 ./time-log 2026-11-12 --save                   # also save this run (see "Saving")
 ./time-log 2026-11-12 --saved                  # show the latest save of that day
+./time-log --events events.json                # the attendance flag and what Chronoid had in front, per event
 ```
 
 `start` and `end` are ISO timestamps that include the offset, like `2026-11-12T11:00:00-05:00`.
+`response` is your answer to the invite (`accepted`, `declined`, `needsAction`, `tentative`). Add `"platform"`
+(like `Google Meet`) for a meeting that is not on Zoom.
 
 ## Saving
 
@@ -217,9 +220,9 @@ means that source has nothing for that project. Durations read `1h 33m`, and und
 
 | Column | Source | How it is counted |
 |---|---|---|
-| Chronoid | `~/Library/Application Support/com.vu.Chronoid/db.sqlite`, read only | Tracked app time, idle excluded, under the category Chronoid assigned. A span counts on the day it starts. Your manual timers are listed, not added. |
+| Chronoid | `~/Library/Application Support/com.vu.Chronoid/db.sqlite`, read only | Tracked app time, idle excluded, under the category Chronoid assigned. A span counts on the day it starts. Your manual timers are listed, not added. `--show` lists the top three windows for each app. Slack titles are cleaned, so one channel is one name. |
 | Chrome | The `Default` profile's history, read from a temporary copy | Only sites in the config. Visits no more than the idle gap apart count as time between them. This is an estimate. |
-| Calendar | Events passed with `--calendar` | The scheduled length, for events you attended. An event goes to a project only if the config has a title rule for it. |
+| Calendar | Events passed with `--calendar` | The scheduled length of events you accepted. An event you have not accepted shows as unaccepted, and the tool guesses whether you attended from the Zoom meeting window in Chronoid, flagged as a guess. A meeting that is not on Zoom, or a time Chronoid has no data for, gets no guess and is not counted. If you told the tool whether you attended, your answer is used. `--show` lists each event with the apps Chronoid had in front. |
 | Claude Code | `~/.claude/projects`, through `claude-time` | Claude's own turn timer (`durationMs`, logged after each turn), placed at the end of each turn. |
 | Codex | `~/.codex/sessions` | Log entries no more than the idle gap apart. Approval-review sessions (`guardian_review`) are skipped. |
 
@@ -241,6 +244,8 @@ rule shows as Unmapped, and the tool never guesses a project.
 | `codex_sessions` | `cwd_contains` to a project |
 | `calendar.calendars` | Which calendars `/time-log` reads |
 | `calendar.events` | `title_contains` to a project |
+| `attendance` | The Zoom window that means you were in a meeting, and the minutes of it that count as attending (guess) |
+| `attendance_stated` | Meetings you told the tool you did or did not attend, by date and title |
 | `non_project_categories` | Chronoid categories that are not projects |
 | `rollup` | Projects added together in the suggestion |
 

@@ -68,6 +68,8 @@ How the user works today:
 - "meeting's are tricky. i work on the side in most of my meetings. so cautious with that one. i still want to include meeting time for my report, but my own judegement on where to log the time."
 - 2026-11-12: "LGNDX - DTO Weekly" was not attended ("no i didnt").
 - 2026-11-13: "INVERT Scope Lock, Next Steps" was not attended ("no").
+- Later, instead of asking about attendance: "if i dont accept them, just say unaccepted. but you should also be able to see zoom interactions and guess wehtehre or not i attended, but leave it flagged as a guess or assumption."
+- Built: an event the user has not accepted shows as "unaccepted". For a Zoom meeting, the tool guesses attendance from the Zoom "Zoom Meeting" window in Chronoid (5 minutes or more counts as attended) and labels it "GUESS". A meeting not on Zoom, or a time with no Chronoid data, gets no guess and is not counted. The user's own answers are kept in the config under `attendance_stated`. Claude chose the 5 minutes and the Zoom-only guess.
 
 ### Output
 - One table per day, one row per project, one column per source. The user: "yes, but that's incredibly difficult to read and follow", then accepted a table with proof available on request ("that's pretty good. perfect").
@@ -99,6 +101,12 @@ Claude's three options were: 1) a best recommendation, with one number as the he
 The recommendation that was accepted: the Claude running number is Claude's own turn timer (`durationMs`, logged after each turn). The 5-minute rule number and the open tool call stretches sit beside it as evidence, and the count of turn timers against prompts is shown so missing timers are visible.
 
 Context the user gave on the three sessions on 2026-11-13: "translations was a massive, multi-sub-agent, long running tasks / memory was also long running, but more hands on. / the others are pretty literally hands on and didn't sit for long". The turn timer matched this for all five sessions.
+
+### Slack titles
+The user, on cleaning up Slack window titles so one channel is one name: "5: yes absolutely". Built: a leading `!` or `*` and `- N new item(s)` are stripped from Slack titles, and `--show` lists the top three windows per app.
+
+### Saved days
+The user: "1 yes. save 12,13,16,17,18". Saved on 2026-11-19 to `~/.claude-time/time-log/`. Chronoid has no data for the 16th and 17th.
 
 ### Saving a day
 Claude asked whether `time-log` should save only when asked or also on a schedule (a background job). The user: "when i ask only."
@@ -158,11 +166,14 @@ Files in this repo:
 
 The user said "i'm cool to do all of those" about this list of cross-checks that Claude proposed. Meetings are to be handled cautiously (Section 2).
 - Separate approval waits from real running time, using Chronoid's record of which Ghostty tab was in front.
-- Check meeting attendance against Zoom, Teams and Meet time in Chronoid, shown as evidence only.
-- Show what was in front during each meeting.
+- Check meeting attendance against Zoom, Teams and Meet time in Chronoid, shown as evidence only. Built 2026-11-19: `time-log --events`, and each calendar row in `--show` lists the apps Chronoid had in front.
+- Show what was in front during each meeting. Built, same as above.
 - Place hands-on time by project from window titles and URLs, as evidence and not applied silently.
-- Check for overlap between sources (Daily Standup in Chronoid and the calendar, Chrome against Chronoid, Codex against the ChatGPT app).
+- Dropped by the user: overlap checks between sources. The user: "it's fine. as i have said manytimes, i use my judgement on this. i want to track how long SOMETHING/ONE is working on a proiject."
 - Show agent time that ran while the user was in another project's tab.
+
+## 5b. Optional, not built
+- **Range view.** Adding up the saved days by project over a week or a month, with the suggested hours per day and in total, and optionally a place to record the hours the user actually logged. The user: "yeah, lets keep range as an option". Before that: "i'm curious about the range view, but i probably won't do it." A mockup from the saved days of 2026-11-12 to 11-18 was shown. Nothing was built.
 
 ## 6. Parked: a stand-alone recorder to replace Chronoid
 
@@ -206,6 +217,7 @@ What the user said:
 - Codex: `~/.codex/sessions/YYYY/MM/DD/*.jsonl`. Tool calls and results are logged with a `call_id`. Sessions with `thread_source: guardian_review` are approval reviews and are skipped.
 - Claude Code writes a `turn_duration` system entry after each completed turn with `durationMs`. On 2026-11-13 it was far shorter than the wall-clock turn (for example a turn from 11:21 to 13:49 logged 8.4 minutes), which suggests it leaves out waiting. Claude Code also writes `away_summary` entries. This is Claude's inference from the logs, not documented behavior.
 - Nothing is logged between a tool call and its result, so approval waits cannot be told apart from long commands by the log alone. Chronoid's record of which Ghostty tab was in front matched the moment of the result in 10 of 11 long calls on 2026-11-13, which fits approvals but does not prove them.
+- Chronoid has no data for 2026-11-14 to 2026-11-17, and on 2026-11-18 it starts at 12:09 (checked 2026-11-19). The app was running on 2026-11-19. The reason is not known.
 - Calendar: only through the Claude connector, so only `/time-log` can read it.
 
 ## 9. The user's messages in order
@@ -289,3 +301,10 @@ What the user said:
 77. "those are all in MD files. it's fine. what else?"
 78. "5. did you ever develop an actual app to watch?" (5 was daily snapshots from Claude's list. The answer to the question: no app was built.)
 79. "when i ask only."
+80. "okay. what's next?"
+81. "1 yes. save 12,13,16,17,18 2 it's fine. as i have said manytimes, i use my judgement on this. i want to track how long SOMETHING/ONE is working on a proiject. 3 what? yes i thought this was already done. you should also have access to google calendar 4 what's your question? 5 explain 6 parked for now" (the answers to Claude's list: 1 save those five days, 2 overlap evidence dropped, 3 meeting evidence, 4 hands-on evidence by window title and URL, 5 Slack cleanup, 6 the stand-alone recorder)
+82. "if i dont accept them, just say unaccepted. but you should also be able to see zoom interactions and guess wehtehre or not i attended, but leave it flagged as a guess or assumption." and, about Claude's answer to item 4 ("I had no question there" followed by a question): "you said no question, and then you asked me a question." and "5: yes absolutely"
+83. "can you re-run for last thursday through yesterday and seave the data? or is the data the same and the output has changed?" (the saved data matched fresh runs, so only 2026-11-14 was added)
+84. "got it. what's next?"
+85. "hmm. i'm curious about the range view, but i probably won't do it. can you give me an idea"
+86. "yeah, lets keep range as an option"
